@@ -161,7 +161,10 @@ input[type=date].fi{color-scheme:light}
       <h1>Budget <em>2026</em></h1>
       <div class="header-sub">Pakistani Rupees (₨)</div>
     </div>
-    <div class="save-pill" id="save-pill">all changes saved</div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button class="save-pill" style="cursor:pointer;font-family:var(--mono)" onclick="exportData()" title="Download JSON backup">↓ export</button>
+      <div class="save-pill" id="save-pill">loading…</div>
+    </div>
   </div>
   <div class="month-nav" id="month-nav"></div>
   <div id="month-view">
@@ -256,20 +259,159 @@ const SPD_CATS=[
   {id:'misc',label:'Miscellaneous',color:'#0891b2',icon:'📦',presets:[]},
   {id:'aj',label:'AJ',color:'#dc2626',icon:'♥',presets:[]},
 ];
-const SK='budget2026_v3';
+// ======= CLOUD SYNC CONFIG =======
+const API_BASE = 'https://budget-api.usama-muhammad-ismail.workers.dev';
+const SK = 'budget2026_v3';               // legacy — read once for migration
+const CACHE_KEY = 'budget2026_cache';     // local fallback cache
+const PIN_KEY = 'budget2026_pin';         // stored per-device
+const SAVE_DEBOUNCE_MS = 1500;            // >1s so we don't exceed KV write limit
+const REFOCUS_DEBOUNCE_MS = 3000;         // don't refetch more than once per 3s
+// =================================
+
 let DB={},curMonth=3,curInner='summary',txFilter='all';
 let openCats={},activePreset={},openCustom={},recurOn={},charts={},saveTimer=null;
+let authPin = localStorage.getItem(PIN_KEY) || '';
+let dirtyMonths = new Set();              // which months need flushing
+let flushInflight = false;
+let lastRefocus = 0;
 
-function load(){try{const r=localStorage.getItem(SK);if(r)DB=JSON.parse(r);}catch(e){DB={};}}
-function save(){
-  const p=document.getElementById('save-pill');
-  p.textContent='saving…';p.className='save-pill saving';
-  clearTimeout(saveTimer);
-  saveTimer=setTimeout(()=>{
-    try{localStorage.setItem(SK,JSON.stringify(DB));p.textContent='all changes saved';p.className='save-pill saved';}
-    catch(e){p.textContent='save failed';p.className='save-pill';}
-  },400);
+async function load(){
+  setSyncStatus('loading');
+  // 1. Load local cache first (so UI can render instantly even offline)
+  try{
+    const r = localStorage.getItem(CACHE_KEY);
+    if(r) DB = JSON.parse(r);
+    else {
+      // one-time migration from old localStorage key
+      const legacy = localStorage.getItem(SK);
+      if(legacy) DB = JSON.parse(legacy);
+    }
+  }catch(e){DB={};}
+
+  // 2. Ensure we have a PIN
+  if(!authPin){
+    const entered = prompt('Enter your budget PIN:');
+    if(!entered){setSyncStatus('offline');return;}
+    authPin = entered;
+  }
+
+  // 3. Fetch fresh from cloud
+  try{
+    const r = await fetch(API_BASE+'/data',{headers:{'X-Auth-PIN':authPin}});
+    if(r.status===401){
+      authPin=''; localStorage.removeItem(PIN_KEY);
+      alert('PIN invalid. Please reload and try again.');
+      setSyncStatus('auth-fail'); return;
+    }
+    if(r.status===429){
+      alert('Too many failed PIN attempts. Try again in 15 minutes.');
+      setSyncStatus('locked'); return;
+    }
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const cloud = await r.json();
+    DB = cloud;
+    localStorage.setItem(CACHE_KEY, JSON.stringify(DB));
+    localStorage.setItem(PIN_KEY, authPin);
+    setSyncStatus('synced');
+  }catch(e){
+    console.warn('Cloud fetch failed, using local cache:', e);
+    setSyncStatus('offline');
+  }
 }
+
+function save(mChanged){
+  // Track which month changed (null means unknown → flush all)
+  if(typeof mChanged === 'number' && mChanged >= 0) dirtyMonths.add('M'+mChanged);
+  else Object.keys(DB).filter(k=>/^M\d{1,2}$/.test(k)).forEach(k=>dirtyMonths.add(k));
+
+  // Always write to local cache immediately
+  try{localStorage.setItem(CACHE_KEY, JSON.stringify(DB));}catch(e){}
+
+  if(!authPin){setSyncStatus('offline');return;}
+  setSyncStatus('saving');
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushToCloud, SAVE_DEBOUNCE_MS);
+}
+
+async function flushToCloud(){
+  if(flushInflight){saveTimer=setTimeout(flushToCloud,500);return;}
+  if(dirtyMonths.size===0){setSyncStatus('synced');return;}
+  flushInflight = true;
+  const toFlush = Array.from(dirtyMonths);
+  dirtyMonths.clear();
+  try{
+    await Promise.all(toFlush.map(m=>
+      fetch(API_BASE+'/data/'+m,{
+        method:'PUT',
+        headers:{'Content-Type':'application/json','X-Auth-PIN':authPin},
+        body: JSON.stringify(DB[m] || {income:{},entries:{}}),
+      }).then(r=>{
+        if(r.status===401) throw new Error('auth');
+        if(r.status===429) throw new Error('locked');
+        if(!r.ok) throw new Error('http '+r.status);
+      })
+    ));
+    setSyncStatus('synced');
+  }catch(e){
+    // Re-mark as dirty for retry
+    toFlush.forEach(m=>dirtyMonths.add(m));
+    if(e.message==='auth'){setSyncStatus('auth-fail');}
+    else if(e.message==='locked'){setSyncStatus('locked');}
+    else {
+      setSyncStatus('offline');
+      // Retry in 30s
+      setTimeout(()=>{if(dirtyMonths.size>0){saveTimer=setTimeout(flushToCloud,100);}}, 30000);
+    }
+  }finally{
+    flushInflight = false;
+  }
+}
+
+function setSyncStatus(s){
+  const p = document.getElementById('save-pill'); if(!p) return;
+  const map = {
+    'loading':  ['loading…',      'save-pill saving'],
+    'saving':   ['saving…',       'save-pill saving'],
+    'synced':   ['synced',        'save-pill saved'],
+    'offline':  ['offline — local','save-pill'],
+    'auth-fail':['auth failed',   'save-pill'],
+    'locked':   ['rate-limited',  'save-pill'],
+  };
+  const [txt,cls] = map[s] || map['synced'];
+  p.textContent = txt; p.className = cls;
+}
+
+async function exportData(){
+  if(!authPin){alert('Not authenticated.');return;}
+  try{
+    const r = await fetch(API_BASE+'/export',{headers:{'X-Auth-PIN':authPin}});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'budget-2026-backup-'+new Date().toISOString().slice(0,10)+'.json';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }catch(e){alert('Export failed: '+e.message);}
+}
+
+// Refetch when window regains focus — but flush any pending save first
+async function handleRefocus(){
+  const now = Date.now();
+  if(now - lastRefocus < REFOCUS_DEBOUNCE_MS) return;
+  lastRefocus = now;
+  if(!authPin) return;
+  if(saveTimer || dirtyMonths.size>0){
+    clearTimeout(saveTimer);
+    await flushToCloud();
+  }
+  await load();
+  buildNav();
+  if(curMonth===-1) buildYearView(); else buildMonthView();
+}
+window.addEventListener('focus', handleRefocus);
+document.addEventListener('visibilitychange', ()=>{if(!document.hidden) handleRefocus();});
 function mk(m){return 'M'+m;}
 function mdb(m){if(!DB[mk(m)])DB[mk(m)]={income:{},entries:{}};return DB[mk(m)];}
 function getInc(m,id){return parseFloat(mdb(m).income[id])||0;}
@@ -335,7 +477,7 @@ function buildIncTable(m,ti){
 function onIncIn(el){
   const m=parseInt(el.dataset.m),id=el.dataset.id,db=mdb(m);
   if(el.value&&el.value!='0')db.income[id]=el.value;else delete db.income[id];
-  save();buildMonthView();
+  save(m);buildMonthView();
 }
 function buildCatBlocks(m){
   const container=document.getElementById('cat-blocks');container.innerHTML='';
@@ -410,7 +552,7 @@ function savePreset(m,cid,pid){
   db.entries[cid].push({desc:preset?.label||pid,amt,date,pid,recur:!!(recurOn[rkey])});
   db.entries[cid].sort((a,b)=>a.date.localeCompare(b.date));
   activePreset[cid]=null;delete recurOn[rkey];
-  save();buildMonthView();
+  save(m);buildMonthView();
 }
 function saveCust(m,cid){
   const desc=(document.getElementById('cfd-'+cid)?.value||'').trim();
@@ -420,14 +562,14 @@ function saveCust(m,cid){
   const db=mdb(m);if(!db.entries[cid])db.entries[cid]=[];
   db.entries[cid].push({desc:desc||'Entry',amt,date});
   db.entries[cid].sort((a,b)=>a.date.localeCompare(b.date));
-  openCustom[cid]=false;save();buildMonthView();
+  openCustom[cid]=false;save(m);buildMonthView();
 }
-function delEntry(m,cid,idx){const db=mdb(m);if(db.entries[cid])db.entries[cid].splice(idx,1);save();buildMonthView();}
+function delEntry(m,cid,idx){const db=mdb(m);if(db.entries[cid])db.entries[cid].splice(idx,1);save(m);buildMonthView();}
 function copyRecur(m,cid){
   const toCopy=getRecurToCopy(m,cid);const db=mdb(m);if(!db.entries[cid])db.entries[cid]=[];
   toCopy.forEach(p=>{db.entries[cid].push({desc:p.label,amt:parseFloat(p.amt),date:today(),pid:p.id,recur:true});});
   db.entries[cid].sort((a,b)=>a.date.localeCompare(b.date));
-  save();buildMonthView();
+  save(m);buildMonthView();
 }
 function buildProgs(m,ts){
   const pl=document.getElementById('prog-list');pl.innerHTML='';const base=ts||1;let any=false;
@@ -483,7 +625,7 @@ function buildYearView(){
   dChart('sav');
   charts['sav']=new Chart(document.getElementById('chart-sav'),{type:'line',data:{labels:MONTHS,datasets:[{data:cumD,borderColor:'#6d28d9',backgroundColor:'rgba(109,40,217,.07)',tension:.4,pointRadius:4,borderWidth:2,fill:true,pointBackgroundColor:'#6d28d9',pointBorderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>' '+fmt(ctx.parsed)},bodyFont:{family:"'DM Mono'",size:12}}},scales:{x:{ticks:{autoSkip:false,font:tf},grid:{color:gc},border:{color:bc}},y:{ticks:{callback:v=>fmtS(v),font:tf},grid:{color:gc},border:{color:bc}}}}});
 }
-load();buildNav();buildMonthView();
+(async()=>{await load();buildNav();buildMonthView();})();
 </script>
 </body>
 </html>
